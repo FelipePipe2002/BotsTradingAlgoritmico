@@ -1,22 +1,25 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
-import datetime  # For datetime objects
-import os.path  # To manage paths
-import sys  # To find out the script name (in argv[0])
+import datetime
+import os.path
+import sys
 
-# Import the backtrader platform
 import backtrader as bt
+import yfinance as yf
+import locale
 
-
-# Create a Stratey
 class Strategy(bt.Strategy):
     params = (
         ("bollinger_period", 20),
         ("bollinger_dev", 2),
-        ("short_sma_period", 15),
-        ("long_sma_period", 60),
-        ("stop_loss_percent", 0.3),
+        ("short_sma_period", 50),
+        ("long_sma_period", 150),
+        ("withdraw_profits",20),
+        ("stop_loss",5),
+        ("acceptable_margin",2),
+        ("high_price_hammer",350),#3.5 veces el tamaño de la vela (close - open)
+        ("low_price_hammer",10),
     )
 
     def log(self, txt, dt=None):
@@ -25,19 +28,16 @@ class Strategy(bt.Strategy):
         print('%s, %s' % (dt.isoformat(), txt))
 
     def __init__(self):
-        # Keep a reference to the "close" line in the data[0] dataseries
         self.dataclose = self.datas[0].close
-
-        # To keep track of pending orders and buy price/commission
+        
         self.order = None
         self.buyprice = None
         self.buycomm = None
+        self.hammer_buy = None
 
-        # Add Bollinger Bands indicator
         self.bollinger = bt.indicators.BollingerBands(
             self.datas[0], period=self.params.bollinger_period, devfactor=self.params.bollinger_dev)
 
-        # Add short-term and long-term Simple Moving Averages
         self.short_sma = bt.indicators.SimpleMovingAverage(
             self.datas[0], period=self.params.short_sma_period)
 
@@ -49,7 +49,7 @@ class Strategy(bt.Strategy):
             return
         if order.status in [order.Completed]:
             self.bar_executed = len(self)
-
+        
         self.order = None
 
     def notify_trade(self, trade):
@@ -57,99 +57,135 @@ class Strategy(bt.Strategy):
             return
 
     def bad_days(self):
-
-        returns = [self.dataclose[i] - self.dataclose[i - 1] for i in range(-1, -4, -1)]
-        return all(return_ < 0 for return_ in returns)
+        balance = 0
+        for i in range(-1,-4,-1):
+            balance += self.dataclose[i] - self.dataclose[i-1]        
+        return balance < - self.params.acceptable_margin #tendencia bajista considerable
     
     def good_days(self):
-        returns = [self.dataclose[i] - self.dataclose[i - 1] for i in range(-1, -4, -1)]
-        return all(return_ > 0 for return_ in returns)
+        balance = 0
+        for i in range(-1,-4,-1):
+            balance += self.dataclose[i] - self.dataclose[i-1]        
+        return balance > self.params.acceptable_margin #tendencia bajista considerable
 
-    def is_hammer(self):
-        # Check if the current candle is a hammer
+    def is_hammer(self): #compra 1 dia despues de encontrar el martillo
         close = self.dataclose[0]
         open_ = self.datas[0].open[0]
         high = self.datas[0].high[0]
         low = self.datas[0].low[0]
+        
+        if(close > open_ and (open_-low) > (close-open_)*(self.params.high_price_hammer/100) and ((high-close) < (close-open_)*(self.params.low_price_hammer/100)) and self.bad_days()):
+            self.hammer_buy = self.datas[0].datetime.date()
+            return True
+        
+        return False
 
-        # Conditions for a bullish hammer
-        return close > open_ and self.bad_days()
-
-    def is_deadman(self):
-        # Check if the current candle is a hammer
+    def is_deadman(self): #compra 1 dia despues de encontrar el martillo
         close = self.dataclose[0]
         open_ = self.datas[0].open[0]
         high = self.datas[0].high[0]
         low = self.datas[0].low[0]
-
-        # Conditions for a bullish hammer
-        return close < open_ and self.good_days()
-
+        
+        if(close < open_ and (close-low) > (open_-close)*(self.params.high_price_hammer/100) and (high-open_) < (open_-close)*(self.params.low_price_hammer/100) and self.bad_days()):
+            return True
+        
+        return False
+    
+    def is_inverted_hammer(self): #compra 1 dia despues de encontrar el martillo
+        close = self.dataclose[0]
+        open_ = self.datas[0].open[0]
+        high = self.datas[0].high[0]
+        low = self.datas[0].low[0]
+        
+        if(close > open_ and (high-close) > (close-open_)*(self.params.high_price_hammer/100) and not((low-open_) < (close-open_)*-(self.params.low_price_hammer/100)) and self.bad_days()):
+            self.hammer_buy = self.datas[0].datetime.date()
+            return True
+        
+        return False
+        
+    
+    def sell_hammer(self):#vender 3 dias despues de encontrar el martillo
+        if (self.hammer_buy is not None and self.datas[0].datetime.date() - self.hammer_buy >= datetime.timedelta(days=2)): 
+            self.hammer_buy = None
+            return True
+        return False
+            
+    def is_shooting_Star(self):
+        close = self.dataclose[0]
+        open_ = self.datas[0].open[0]
+        high = self.datas[0].high[0]
+        low = self.datas[0].low[0]
+        
+        if(close < open_ and (high-close) > (open_-close)*(self.params.high_price_hammer/100) and not((low-close) < (open_-close)*-(self.params.low_price_hammer/100)) and self.good_days()):
+            self.hammer_buy = self.datas[0].datetime.date()
+            return True
+        
+        return False
+    
+    def stop_loss(self):
+        return self.dataclose[0] < self.buyprice * (1 - self.params.stop_loss / 100)
 
     def next(self):
         if self.order:
             return
-
         if not self.position:
-            # Buy when closing price is below the lower Bollinger Band
-            # and short-term SMA is above long-term SMA
-            if (self.dataclose[0] < self.bollinger.lines.bot[0] and
-                self.short_sma > self.long_sma and self.short_sma > self.long_sma[-1]
-                ) or self.is_hammer():
+            if (
+                (self.dataclose[0] < self.bollinger.lines.bot[0]) or
+                (self.short_sma > self.long_sma and self.short_sma[-1] < self.long_sma[-1]) or 
+                (self.is_hammer()) or
+                (self.is_inverted_hammer())
+               ):
                 size = int(self.broker.get_cash() * .9 / self.dataclose)
-
+                self.buyprice = self.dataclose[0]
                 self.order = self.buy(size=size)
+            
 
         else:
-            # Sell when closing price is above the upper Bollinger Band
-            # and short-term SMA is below long-term SMA
-            if (self.dataclose[0] > self.bollinger.lines.top[0] and
-                self.short_sma < self.long_sma and self.short_sma < self.long_sma[-1]
-                ) or self.is_deadman():
+            if (
+                (self.short_sma < self.long_sma and self.short_sma[-1] > self.long_sma[-1]) or
+                (self.is_shooting_Star()) or
+                (self.sell_hammer()) or
+                (self.stop_loss())  or
+                (self.is_deadman())
+               ):
                 self.order = self.sell(size=self.position.size)
+            
+
 
 if __name__ == '__main__':
-    # Create a cerebro entity
     cerebro = bt.Cerebro()
 
-    # Add a strategy
     cerebro.addstrategy(Strategy)
 
-    # Datas are in a subfolder of the samples. Need to find where the script is
-    # because it could have been called from anywhere
     modpath = os.path.dirname(os.path.abspath(sys.argv[0]))
-    datapath = os.path.join(modpath, './datas/orcl-1995-2014.txt')
+    datapath = os.path.join(modpath, './datas/nvda-1999-2014.txt')
 
-    # Create a Data Feed
+    '''
     data = bt.feeds.YahooFinanceCSVData(
         dataname=datapath,
         # Do not pass values before this date
         fromdate=datetime.datetime(1996, 1, 1),
         # Do not pass values before this date
-        todate=datetime.datetime(2014, 12, 31),
+        todate=datetime.datetime(2015, 12, 31),
         # Do not pass values after this date
         reverse=False)
-
-    # Add the Data Feed to Cerebro
     cerebro.adddata(data)
-
-    # Set our desired cash start
-    cerebro.broker.setcash(100000.0)
+    '''
+    symbol = "KO"
+    data = yf.download(symbol, start="1996-01-01", end="2023-12-30")
+    cerebro.adddata(bt.feeds.PandasData(dataname=data))
     
 
-    # Set the commission
+    cerebro.broker.setcash(100000.0)
     cerebro.broker.setcommission(commission=0.0001)
 
-    # Print out the starting conditions
+    locale.setlocale(locale.LC_CTYPE, '')
     print('Start Portfolio Value: %.2f, Cash: %.2f' % (cerebro.broker.getvalue(), cerebro.broker.get_cash()))
 
-    # Run over everything
     cerebro.run()
-
-    # Print out the final result with both portfolio value and cash
+    
     print('Final Portfolio Value: %.2f, Cash: %.2f' % (cerebro.broker.getvalue(), cerebro.broker.get_cash()))
 
 
-    # Plot the result
-    cerebro.plot()
-    
+    cerebro.plot(style='candlestick')
+

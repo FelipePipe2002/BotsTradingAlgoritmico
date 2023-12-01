@@ -1,4 +1,0 @@
-Por ahora estamos utilizando Cross Method y Bandas de Bolliger
-
-//encontre este video https://www.youtube.com/watch?v=RbQaARxEW9o&ab_channel=CodeTrading
-// capaz esta bueno
